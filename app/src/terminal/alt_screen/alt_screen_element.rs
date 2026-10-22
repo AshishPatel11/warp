@@ -934,7 +934,7 @@ impl Element for AltScreenElement {
         let inline_thumbnails = self
             .inline_thumbnail_finder
             .as_ref()
-            .map(|find| find(grid, cell_size))
+            .map(|find| find(grid, cell_size, app))
             .unwrap_or_default();
         drop(sampler);
         drop(model);

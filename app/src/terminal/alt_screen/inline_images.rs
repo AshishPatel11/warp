@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use regex::Regex;
+use warpui::AppContext;
 use warpui::assets::asset_cache::{AssetSource, LocalFileContentVersion};
 use warpui::geometry::vector::Vector2F;
 
@@ -39,6 +40,8 @@ const THUMBNAIL_ROW_HEIGHTS: [usize; 2] = [4, 2];
 const THUMBNAIL_ASPECT_RATIO: f32 = 1.6;
 /// Blank columns kept between a thumbnail and the nearest text.
 const GAP_COLUMNS: usize = 1;
+/// Columns left free at the right edge, where full-screen apps often draw a scrollbar.
+const RIGHT_EDGE_COLUMNS: usize = 2;
 const MAX_THUMBNAILS: usize = 8;
 #[cfg(feature = "local_fs")]
 const MAX_CACHED_PATHS: usize = 512;
@@ -98,7 +101,39 @@ pub struct InlineThumbnail {
 ///
 /// The alt screen calls this while painting rather than while rendering, because a full-screen app
 /// can change the grid many times between renders.
-pub type InlineThumbnailFinder = Box<dyn Fn(&GridHandler, Vector2F) -> Vec<InlineThumbnail>>;
+pub type InlineThumbnailFinder =
+    Box<dyn Fn(&GridHandler, Vector2F, &AppContext) -> Vec<InlineThumbnail>>;
+
+/// Temporary diagnostics: describes the text, OSC 8 links and the characters in `columns` of `row`.
+pub fn debug_describe_row(grid: &GridHandler, row: usize, columns: Range<usize>) -> String {
+    let Some(row_text) = RowText::from_grid(grid, row) else {
+        return format!("row {row}: missing");
+    };
+    let right: String = grid
+        .row(row)
+        .map(|cells| {
+            columns
+                .filter(|&column| column < cells.len())
+                .map(|column| cells[column].c)
+                .collect()
+        })
+        .unwrap_or_default();
+    format!(
+        "row {row}: text={:?} right={right:?} links={:?}",
+        row_text.text.trim_end(),
+        row_text.links
+    )
+}
+
+/// Temporary diagnostics: describes the rows in `rows` whose text contains `needle`.
+pub fn debug_rows_containing(grid: &GridHandler, rows: Range<usize>, needle: &str) -> Vec<String> {
+    rows.filter(|&row| {
+        RowText::from_grid(grid, row).is_some_and(|row_text| row_text.text.contains(needle))
+    })
+    .take(4)
+    .map(|row| debug_describe_row(grid, row, 0..0))
+    .collect()
+}
 
 /// Finds image paths in `rows` of `grid`: text that looks like an image path, and OSC 8 links to
 /// local image files (Claude Code labels pasted images as `[Image #1]`, linked to a saved copy).
@@ -229,8 +264,9 @@ pub fn place_thumbnails(
 
         let placement = THUMBNAIL_ROW_HEIGHTS.iter().find_map(|&height| {
             let width = thumbnail_width_in_columns(height, cell_size);
-            let first_column = grid_columns.checked_sub(width)?;
-            let blank_columns = first_column.checked_sub(GAP_COLUMNS)?..grid_columns;
+            let last_column = grid_columns.checked_sub(RIGHT_EDGE_COLUMNS)?;
+            let first_column = last_column.checked_sub(width)?;
+            let blank_columns = first_column.checked_sub(GAP_COLUMNS)?..last_column;
             let rows = image.mention.row..image.mention.row + height;
             let fits = rows.end <= grid_rows
                 && !placements
@@ -242,7 +278,7 @@ pub fn place_thumbnails(
             fits.then(|| ThumbnailPlacement {
                 image_index,
                 rows,
-                columns: first_column..grid_columns,
+                columns: first_column..last_column,
             })
         });
 
@@ -274,7 +310,7 @@ pub fn is_blank(grid: &GridHandler, row: usize, columns: Range<usize>) -> bool {
     columns.end <= cells.len()
         && cells[columns]
             .iter()
-            .all(|cell| cell.c == ' ' || cell.c == '\0')
+            .all(|cell| cell.c.is_whitespace() || cell.c == '\0')
 }
 
 #[cfg(feature = "local_fs")]

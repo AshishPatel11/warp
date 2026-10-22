@@ -93,7 +93,7 @@ fn places_thumbnail_at_right_edge_of_mention_row() {
         vec![ThumbnailPlacement {
             image_index: 0,
             rows: 3..7,
-            columns: 67..80,
+            columns: 65..78,
         }]
     );
 }
