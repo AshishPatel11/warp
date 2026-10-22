@@ -31,6 +31,7 @@ use warp_util::standardized_path::StandardizedPath;
 use crate::ai::block_context::BlockContext;
 use crate::global_resource_handles::GlobalResourceHandlesProvider;
 pub(crate) mod docker_sandbox;
+mod inline_images;
 mod link_detection;
 mod open_in_warp;
 mod pane_impl;
@@ -54,7 +55,7 @@ mod zero_state_block;
 
 use std::any::Any;
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
@@ -2702,6 +2703,10 @@ pub struct TerminalView {
     #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
     file_link_scanning_join_handle: Option<JoinHandle<()>>,
 
+    #[cfg(feature = "local_fs")]
+    inline_image_paths: crate::terminal::alt_screen::inline_images::ImagePathCache,
+    inline_thumbnail_hovered: Rc<Cell<bool>>,
+
     last_focus_ts: Option<NaiveDateTime>,
     tips_completed: ModelHandle<TipsCompleted>,
 
@@ -4442,6 +4447,9 @@ impl TerminalView {
             inline_banners_state: Default::default(),
             bookmarked_blocks: Default::default(),
             file_link_scanning_join_handle: None,
+            #[cfg(feature = "local_fs")]
+            inline_image_paths: Default::default(),
+            inline_thumbnail_hovered: Default::default(),
             last_focus_ts: None,
             tips_completed: resources.tips_completed.clone(),
             privacy_settings_snapshot: privacy_settings_handle.as_ref(ctx).get_snapshot(ctx),
@@ -25343,6 +25351,13 @@ impl TerminalView {
         }
         alt_screen_element =
             alt_screen_element.with_shared_session_presence(self.shared_session_presence_manager());
+        let inline_thumbnails = self.inline_image_thumbnails(model, app);
+        if !inline_thumbnails.is_empty() {
+            alt_screen_element = alt_screen_element.with_inline_thumbnails(
+                inline_thumbnails,
+                self.inline_thumbnail_hovered.clone(),
+            );
+        }
 
         // Pass voice input toggle key if the CLI agent footer should be rendered
         #[cfg(feature = "voice_input")]
@@ -27871,6 +27886,7 @@ impl TypedActionView for TerminalView {
             | LoadAgentModeConversation
             | DeleteAttachment { .. }
             | OpenAttachmentLightbox { .. }
+            | OpenImagesInLightbox { .. }
             | WriteCodebaseIndex
             | AttachFile
             | ToggleAutoexecuteMode
@@ -28584,6 +28600,29 @@ impl TypedActionView for TerminalView {
                 ctx.dispatch_typed_action(&WorkspaceAction::OpenLightbox {
                     images,
                     initial_index,
+                });
+            }
+            OpenImagesInLightbox {
+                paths,
+                initial_index,
+            } => {
+                let images = paths
+                    .iter()
+                    .map(|path| ui_components::lightbox::LightboxImage {
+                        source: ui_components::lightbox::LightboxImageSource::Resolved {
+                            asset_source: warpui::assets::asset_cache::AssetSource::LocalFile {
+                                path: path.to_string_lossy().into_owned(),
+                                content_version: None,
+                            },
+                        },
+                        description: path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned()),
+                    })
+                    .collect();
+                ctx.dispatch_typed_action(&WorkspaceAction::OpenLightbox {
+                    images,
+                    initial_index: *initial_index,
                 });
             }
             WriteCodebaseIndex => {

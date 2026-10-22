@@ -6,6 +6,7 @@ use super::alt_screen_reporting::AltScreenReporting;
 use super::model::grid::grid_handler::TermMode;
 
 pub mod alt_screen_element;
+pub mod inline_images;
 
 /// Determines if mouse event is intercepted based on SGR_MOUSE mode and mouse reporting setting.
 pub fn should_intercept_mouse(model: &TerminalModel, shift: bool, ctx: &AppContext) -> bool {

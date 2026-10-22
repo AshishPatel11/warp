@@ -1,4 +1,7 @@
+use std::cell::Cell;
 use std::ops::{Deref as _, Range};
+use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use num_traits::Float as _;
@@ -8,11 +11,12 @@ use vec1::Vec1;
 use warp_core::features::FeatureFlag;
 use warp_util::user_input::UserInput;
 use warpui::elements::new_scrollable::{NewScrollableElement, ScrollableAxis};
-use warpui::elements::{Axis, Point as UiPoint, ScrollData, ScrollableElement};
+use warpui::elements::{Axis, Point as UiPoint, ScrollData, ScrollableElement, ZIndex};
 use warpui::event::{DispatchedEvent, InBoundsExt, KeyState, ModifiersState};
 use warpui::fonts::Properties;
 use warpui::geometry::rect::RectF;
 use warpui::geometry::vector::Vector2F;
+use warpui::platform::Cursor;
 use warpui::platform::keyboard::KeyCode;
 use warpui::text::SelectionType;
 use warpui::units::{IntoLines, IntoPixels, Lines, Pixels};
@@ -22,6 +26,7 @@ use warpui::{
     start_trace,
 };
 
+use super::inline_images::InlineThumbnail;
 use super::should_intercept_mouse;
 use crate::appearance::Appearance;
 use crate::pane_group::SplitPaneState;
@@ -53,6 +58,8 @@ use crate::terminal::{
 
 const CLI_SUBAGENT_HORIZONTAL_MARGIN: f32 = 8.;
 const CLI_SUBAGENT_VERTICAL_MARGIN: f32 = 8.;
+/// Space between a thumbnail and the edges of the grid cells it occupies.
+const INLINE_THUMBNAIL_INSET: f32 = 2.;
 
 pub struct AltScreenElement {
     model: Arc<FairMutex<TerminalModel>>,
@@ -86,6 +93,14 @@ pub struct AltScreenElement {
     cursor_hint_text: Option<Box<dyn Element>>,
 
     cli_subagent_view: Option<Box<dyn Element>>,
+
+    inline_thumbnails: Vec<InlineThumbnail>,
+    /// Window-space bounds of each inline thumbnail, set during paint.
+    inline_thumbnail_bounds: Vec<RectF>,
+    inline_thumbnail_z_index: Option<ZIndex>,
+    /// Whether the pointer was over a thumbnail on the previous mouse move. Owned by the terminal
+    /// view because this element is rebuilt on every render.
+    inline_thumbnail_hovered: Rc<Cell<bool>>,
 
     /// Voice input toggle key code for CLI agent footer integration.
     #[cfg_attr(not(feature = "voice_input"), allow(unused))]
@@ -158,8 +173,112 @@ impl AltScreenElement {
             max_scroll_top: None,
             cursor_hint_text,
             cli_subagent_view,
+            inline_thumbnails: Vec::new(),
+            inline_thumbnail_bounds: Vec::new(),
+            inline_thumbnail_z_index: None,
+            inline_thumbnail_hovered: Default::default(),
             voice_input_toggle_key_code: None,
         }
+    }
+
+    /// Draws `thumbnails` over the grid. Clicking one opens all of them in the image lightbox.
+    pub fn with_inline_thumbnails(
+        mut self,
+        thumbnails: Vec<InlineThumbnail>,
+        hovered: Rc<Cell<bool>>,
+    ) -> Self {
+        self.inline_thumbnails = thumbnails;
+        self.inline_thumbnail_hovered = hovered;
+        self
+    }
+
+    fn inline_thumbnail_size(&self, thumbnail: &InlineThumbnail) -> Vector2F {
+        let size_info = &self.grid_render_params.size_info;
+        let placement = &thumbnail.placement;
+        vec2f(
+            placement.columns.len() as f32 * size_info.cell_width_px().as_f32(),
+            placement.rows.len() as f32 * size_info.cell_height_px().as_f32(),
+        ) - vec2f(INLINE_THUMBNAIL_INSET, INLINE_THUMBNAIL_INSET) * 2.
+    }
+
+    fn paint_inline_thumbnails(
+        &mut self,
+        grid_origin: Vector2F,
+        ctx: &mut PaintContext,
+        app: &AppContext,
+    ) {
+        if self.inline_thumbnails.is_empty() {
+            return;
+        }
+        let size_info = self.grid_render_params.size_info;
+        ctx.scene.start_layer(ClipBounds::ActiveLayer);
+        self.inline_thumbnail_z_index = Some(ctx.scene.z_index());
+        self.inline_thumbnail_bounds.clear();
+        for index in 0..self.inline_thumbnails.len() {
+            let size = self.inline_thumbnail_size(&self.inline_thumbnails[index]);
+            let thumbnail = &mut self.inline_thumbnails[index];
+            let origin = grid_origin
+                + vec2f(
+                    size_info.padding_x_px().as_f32()
+                        + thumbnail.placement.columns.start as f32
+                            * size_info.cell_width_px().as_f32(),
+                    thumbnail.placement.rows.start as f32 * size_info.cell_height_px().as_f32(),
+                )
+                + vec2f(INLINE_THUMBNAIL_INSET, INLINE_THUMBNAIL_INSET);
+            thumbnail.element.paint(origin, ctx, app);
+            self.inline_thumbnail_bounds.push(RectF::new(origin, size));
+        }
+        ctx.scene.stop_layer();
+    }
+
+    /// Handles mouse events over inline thumbnails, so clicks on them never reach the running
+    /// program. Returns `None` for events this doesn't handle.
+    fn dispatch_inline_thumbnail_event(
+        &self,
+        event: &DispatchedEvent,
+        ctx: &mut EventContext,
+    ) -> Option<bool> {
+        let z_index = self.inline_thumbnail_z_index?;
+        let event = event.at_z_index(z_index, ctx)?;
+        let position = match event {
+            Event::LeftMouseDown { position, .. }
+            | Event::LeftMouseUp { position, .. }
+            | Event::LeftMouseDragged { position, .. }
+            | Event::RightMouseDown { position, .. }
+            | Event::MiddleMouseDown { position, .. }
+            | Event::MouseMoved { position, .. } => *position,
+            _ => return None,
+        };
+        // Mouse moves aren't filtered by `at_z_index`, so check for overlays (e.g. menus) here.
+        let hovered_index = (!ctx.is_covered(UiPoint::from_vec2f(position, z_index)))
+            .then(|| {
+                self.inline_thumbnail_bounds
+                    .iter()
+                    .position(|bounds| bounds.contains_point(position))
+            })
+            .flatten();
+
+        if matches!(event, Event::MouseMoved { .. }) {
+            let was_hovered = self.inline_thumbnail_hovered.replace(hovered_index.is_some());
+            if hovered_index.is_some() {
+                ctx.set_cursor(Cursor::PointingHand, z_index);
+            } else if was_hovered {
+                ctx.reset_cursor();
+            }
+        }
+
+        let index = hovered_index?;
+        if matches!(event, Event::LeftMouseDown { .. }) {
+            ctx.dispatch_typed_action(TerminalAction::OpenImagesInLightbox {
+                paths: self
+                    .inline_thumbnails
+                    .iter()
+                    .map(|thumbnail| thumbnail.path.clone())
+                    .collect::<Vec<PathBuf>>(),
+                initial_index: index,
+            });
+        }
+        Some(true)
     }
 
     pub fn with_ligature_rendering(mut self) -> Self {
@@ -658,6 +777,13 @@ impl Element for AltScreenElement {
             );
         }
 
+        for index in 0..self.inline_thumbnails.len() {
+            let size = self.inline_thumbnail_size(&self.inline_thumbnails[index]);
+            self.inline_thumbnails[index]
+                .element
+                .layout(SizeConstraint::strict(size), ctx, app);
+        }
+
         constraint.max
     }
 
@@ -674,6 +800,10 @@ impl Element for AltScreenElement {
             && cli_subagent_view.size().is_some()
         {
             cli_subagent_view.after_layout(ctx, app);
+        }
+
+        for thumbnail in &mut self.inline_thumbnails {
+            thumbnail.element.after_layout(ctx, app);
         }
     }
 
@@ -793,6 +923,10 @@ impl Element for AltScreenElement {
             app,
         );
 
+        drop(sampler);
+        drop(model);
+        self.paint_inline_thumbnails(adjusted_grid_origin, ctx, app);
+
         if let Some(cli_subagent_view) = &mut self.cli_subagent_view {
             ctx.scene.start_layer(ClipBounds::ActiveLayer);
             let size = cli_subagent_view
@@ -831,6 +965,10 @@ impl Element for AltScreenElement {
             && cli_subagent_view.dispatch_event(event, ctx, app)
         {
             return true;
+        }
+
+        if let Some(handled) = self.dispatch_inline_thumbnail_event(event, ctx) {
+            return handled;
         }
 
         let bounds = self

@@ -352,6 +352,11 @@ pub enum TerminalAction {
     OpenAttachmentLightbox {
         index: usize,
     },
+    /// Opens image files in the workspace lightbox, starting at `initial_index`.
+    OpenImagesInLightbox {
+        paths: Vec<PathBuf>,
+        initial_index: usize,
+    },
     WriteCodebaseIndex,
     AttachFile,
     ToggleAutoexecuteMode,
@@ -681,6 +686,9 @@ impl fmt::Debug for TerminalAction {
             DeleteAttachment { index } => write!(f, "DeleteAttachment({index:?})"),
             OpenAttachmentLightbox { index } => {
                 write!(f, "OpenAttachmentLightbox({index:?})")
+            }
+            OpenImagesInLightbox { initial_index, .. } => {
+                write!(f, "OpenImagesInLightbox({initial_index:?})")
             }
             WriteCodebaseIndex => write!(f, "PersistCodebaseIndex"),
             AttachFile => write!(f, "AttachFile"),

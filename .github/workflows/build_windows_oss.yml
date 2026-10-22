@@ -1,0 +1,63 @@
+name: Build warp-oss for Windows
+
+# Builds the open-source Warp binary on GitHub's machines so it doesn't have to be compiled locally.
+# Download the result from the run's "warp-oss-windows" artifact.
+
+on:
+  push:
+    branches:
+      - claude-inline-images
+  workflow_dispatch:
+
+concurrency:
+  group: build-windows-oss-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: ${{ github.repository != 'warpdotdev/warp' }}
+    runs-on: windows-latest
+    timeout-minutes: 240
+    env:
+      CARGO_HOME: C:\cargo
+      CARGO_TERM_COLOR: never
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - name: Enable long paths
+        run: git config --system core.longpaths true
+
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install protoc
+        run: choco install protoc --no-progress -y
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: windows-oss
+          cache-on-failure: true
+
+      - name: Show disk space
+        shell: pwsh
+        run: Get-PSDrive -PSProvider FileSystem | Format-Table Name, Used, Free
+
+      - name: Build
+        shell: bash
+        # No debug info for the huge `warp` crate keeps the build within the runner's memory.
+        run: cargo build --bin warp-oss --features gui --config 'profile.dev.package.warp.debug=0'
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = 'warp-oss-windows'
+          New-Item -ItemType Directory $out | Out-Null
+          Copy-Item target\debug\warp-oss.exe, target\debug\*.dll $out
+          Copy-Item target\debug\x64 (Join-Path $out 'x64') -Recurse
+          Get-ChildItem $out -Recurse | Format-Table FullName, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: warp-oss-windows
+          path: warp-oss-windows
+          retention-days: 7
