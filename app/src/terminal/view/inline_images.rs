@@ -50,7 +50,7 @@ impl TerminalView {
         let session = self
             .active_block_session_id()
             .and_then(|session_id| self.sessions.as_ref(app).get(session_id));
-        if session.is_some_and(|session| !session.is_local()) {
+        if session.as_ref().is_some_and(|session| !session.is_local()) {
             return None;
         }
         let shell_launch_data = session.and_then(|session| session.launch_data().cloned());
