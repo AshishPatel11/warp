@@ -11,7 +11,6 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use regex::Regex;
-use warpui::Element;
 use warpui::assets::asset_cache::{AssetSource, LocalFileContentVersion};
 use warpui::geometry::vector::Vector2F;
 
@@ -88,12 +87,18 @@ pub struct ThumbnailPlacement {
     pub columns: Range<usize>,
 }
 
-/// A thumbnail element ready to be laid out and painted by the alt screen.
+/// A thumbnail for the alt screen to draw.
 pub struct InlineThumbnail {
     pub placement: ThumbnailPlacement,
     pub path: PathBuf,
-    pub element: Box<dyn Element>,
+    pub source: AssetSource,
 }
+
+/// Finds the thumbnails to draw for the grid's current contents, given the cell size.
+///
+/// The alt screen calls this while painting rather than while rendering, because a full-screen app
+/// can change the grid many times between renders.
+pub type InlineThumbnailFinder = Box<dyn Fn(&GridHandler, Vector2F) -> Vec<InlineThumbnail>>;
 
 /// Finds image paths in `rows` of `grid`: text that looks like an image path, and OSC 8 links to
 /// local image files (Claude Code labels pasted images as `[Image #1]`, linked to a saved copy).

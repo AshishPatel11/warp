@@ -2,23 +2,19 @@ use warpui::AppContext;
 
 use super::TerminalView;
 use crate::terminal::TerminalModel;
-use crate::terminal::alt_screen::inline_images::InlineThumbnail;
+use crate::terminal::alt_screen::inline_images::InlineThumbnailFinder;
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "local_fs")] {
+        use std::path::PathBuf;
         use std::sync::LazyLock;
 
-        use warp_core::ui::theme::WarpTheme;
-        use warpui::assets::asset_cache::AssetSource;
-        use warpui::elements::{
-            Border, CacheOption, Container, CornerRadius, Image, Radius,
-        };
-        use warpui::geometry::vector::vec2f;
-        use warpui::{Element, SingletonEntity};
+        use warpui::SingletonEntity;
+        use warpui::geometry::vector::Vector2F;
 
-        use crate::appearance::Appearance;
+        use crate::terminal::model::grid::grid_handler::GridHandler;
         use crate::terminal::alt_screen::inline_images::{
-            ResolvedImage, find_image_path_mentions, is_blank, place_thumbnails,
+            InlineThumbnail, ResolvedImage, find_image_path_mentions, is_blank, place_thumbnails,
         };
         use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
         use crate::terminal::model::block::BlockMetadata;
@@ -32,102 +28,80 @@ static INLINE_IMAGE_PREVIEWS_ENABLED: LazyLock<bool> = LazyLock::new(|| {
     std::env::var("WARP_INLINE_IMAGE_PREVIEWS").map_or(true, |value| value != "0")
 });
 
-#[cfg(feature = "local_fs")]
-const THUMBNAIL_PADDING: f32 = 2.;
-#[cfg(feature = "local_fs")]
-const THUMBNAIL_CORNER_RADIUS: f32 = 4.;
-
 impl TerminalView {
-    /// Builds thumbnails for image files mentioned in a CLI agent's full-screen UI.
+    /// Returns how to find image thumbnails in a CLI agent's full-screen UI, or `None` if this
+    /// pane shouldn't show any.
     #[cfg(feature = "local_fs")]
-    pub(super) fn inline_image_thumbnails(
+    pub(super) fn inline_thumbnail_finder(
         &self,
         model: &TerminalModel,
         app: &AppContext,
-    ) -> Vec<InlineThumbnail> {
+    ) -> Option<InlineThumbnailFinder> {
         if !*INLINE_IMAGE_PREVIEWS_ENABLED
             || CLIAgentSessionsModel::as_ref(app)
                 .session(self.view_id)
                 .is_none()
+            || model.is_shared_session_viewer()
+            || model.is_conversation_transcript_viewer()
         {
-            return Vec::new();
+            return None;
         }
         // Not `pwd_if_local`: it locks the terminal model, which the caller already holds.
-        if model.is_shared_session_viewer() || model.is_conversation_transcript_viewer() {
-            return Vec::new();
-        }
-        let Some(session) = self
+        let session = self
             .active_block_session_id()
-            .and_then(|session_id| self.sessions.as_ref(app).get(session_id))
-            .filter(|session| session.is_local())
-        else {
-            return Vec::new();
-        };
-        let shell_launch_data = session.launch_data().cloned();
-        let Some(working_directory) = self
+            .and_then(|session_id| self.sessions.as_ref(app).get(session_id));
+        if session.is_some_and(|session| !session.is_local()) {
+            return None;
+        }
+        let shell_launch_data = session.and_then(|session| session.launch_data().cloned());
+        // Only relative paths need the working directory, so absolute ones still resolve without it.
+        let working_directory = self
             .active_block_metadata
             .as_ref()
             .and_then(BlockMetadata::current_working_directory)
-            .and_then(|cwd| shell_launch_data.as_ref()?.maybe_convert_absolute_path(cwd))
-            .map(|path| path.to_string_lossy().into_owned())
-        else {
-            return Vec::new();
-        };
-
-        let grid = model.alt_screen().grid_handler();
-        let grid_size = (grid.visible_rows(), grid.columns());
-        let images: Vec<ResolvedImage> = find_image_path_mentions(grid, 0..grid_size.0)
-            .into_iter()
-            .filter_map(|mention| {
-                self.inline_image_paths.resolve(
-                    mention,
-                    &working_directory,
-                    shell_launch_data.as_ref(),
-                )
+            .map(String::from)
+            .or_else(|| model.block_list().active_block().pwd().cloned())
+            .map(|cwd| {
+                shell_launch_data
+                    .as_ref()
+                    .and_then(|data| data.maybe_convert_absolute_path(&cwd))
+                    .unwrap_or_else(|| PathBuf::from(cwd))
+                    .to_string_lossy()
+                    .into_owned()
             })
-            .collect();
-        if images.is_empty() {
-            return Vec::new();
-        }
+            .unwrap_or_default();
+        let path_cache = self.inline_image_paths.clone();
 
-        let cell_size = vec2f(
-            self.size_info.cell_width_px().as_f32(),
-            self.size_info.cell_height_px().as_f32(),
-        );
-        let theme = Appearance::as_ref(app).theme();
-        place_thumbnails(&images, grid_size, cell_size, |row, columns| {
-            is_blank(grid, row, columns)
-        })
-        .into_iter()
-        .map(|placement| {
-            let image = &images[placement.image_index];
-            InlineThumbnail {
-                element: render_thumbnail(image.asset_source(), theme),
-                path: image.path.clone(),
-                placement,
-            }
-        })
-        .collect()
+        Some(Box::new(move |grid: &GridHandler, cell_size: Vector2F| {
+            let grid_size = (grid.visible_rows(), grid.columns());
+            let images: Vec<ResolvedImage> = find_image_path_mentions(grid, 0..grid_size.0)
+                .into_iter()
+                .filter_map(|mention| {
+                    path_cache.resolve(mention, &working_directory, shell_launch_data.as_ref())
+                })
+                .collect();
+            place_thumbnails(&images, grid_size, cell_size, |row, columns| {
+                is_blank(grid, row, columns)
+            })
+            .into_iter()
+            .map(|placement| {
+                let image = &images[placement.image_index];
+                InlineThumbnail {
+                    source: image.asset_source(),
+                    path: image.path.clone(),
+                    placement,
+                }
+            })
+            .collect()
+        }))
     }
 
     #[cfg(not(feature = "local_fs"))]
-    pub(super) fn inline_image_thumbnails(
+    pub(super) fn inline_thumbnail_finder(
         &self,
         _model: &TerminalModel,
         _app: &AppContext,
-    ) -> Vec<InlineThumbnail> {
-        Vec::new()
+    ) -> Option<InlineThumbnailFinder> {
+        None
     }
-}
-
-#[cfg(feature = "local_fs")]
-fn render_thumbnail(source: AssetSource, theme: &WarpTheme) -> Box<dyn Element> {
-    Container::new(Image::new(source, CacheOption::BySize).contain().finish())
-        .with_uniform_padding(THUMBNAIL_PADDING)
-        .with_background(theme.surface_2())
-        .with_border(Border::all(1.).with_border_fill(theme.outline()))
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
-            THUMBNAIL_CORNER_RADIUS,
-        )))
-        .finish()
 }

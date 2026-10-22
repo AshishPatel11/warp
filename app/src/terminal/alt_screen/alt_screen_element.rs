@@ -10,23 +10,27 @@ use pathfinder_geometry::vector::vec2f;
 use vec1::Vec1;
 use warp_core::features::FeatureFlag;
 use warp_util::user_input::UserInput;
+use warpui::assets::asset_cache::{AssetCache, AssetSource, AssetState};
 use warpui::elements::new_scrollable::{NewScrollableElement, ScrollableAxis};
-use warpui::elements::{Axis, Point as UiPoint, ScrollData, ScrollableElement, ZIndex};
+use warpui::elements::{
+    Axis, Border, CornerRadius, Point as UiPoint, Radius, ScrollData, ScrollableElement, ZIndex,
+};
 use warpui::event::{DispatchedEvent, InBoundsExt, KeyState, ModifiersState};
 use warpui::fonts::Properties;
 use warpui::geometry::rect::RectF;
 use warpui::geometry::vector::Vector2F;
+use warpui::image_cache::{AnimatedImageBehavior, CacheOption, FitType, Image, ImageCache};
 use warpui::platform::Cursor;
 use warpui::platform::keyboard::KeyCode;
 use warpui::text::SelectionType;
 use warpui::units::{IntoLines, IntoPixels, Lines, Pixels};
 use warpui::{
     AfterLayoutContext, AppContext, ClipBounds, Element, EntityId, Event, EventContext,
-    LayoutContext, ModelHandle, PaintContext, SizeConstraint, end_trace, record_trace_event,
-    start_trace,
+    LayoutContext, ModelHandle, PaintContext, SingletonEntity, SizeConstraint, end_trace,
+    record_trace_event, start_trace,
 };
 
-use super::inline_images::InlineThumbnail;
+use super::inline_images::{InlineThumbnail, InlineThumbnailFinder};
 use super::should_intercept_mouse;
 use crate::appearance::Appearance;
 use crate::pane_group::SplitPaneState;
@@ -58,8 +62,10 @@ use crate::terminal::{
 
 const CLI_SUBAGENT_HORIZONTAL_MARGIN: f32 = 8.;
 const CLI_SUBAGENT_VERTICAL_MARGIN: f32 = 8.;
-/// Space between a thumbnail and the edges of the grid cells it occupies.
+/// Space between a thumbnail and the edges of the grid cells it occupies, and between its frame
+/// and the image.
 const INLINE_THUMBNAIL_INSET: f32 = 2.;
+const INLINE_THUMBNAIL_CORNER_RADIUS: f32 = 4.;
 
 pub struct AltScreenElement {
     model: Arc<FairMutex<TerminalModel>>,
@@ -94,6 +100,8 @@ pub struct AltScreenElement {
 
     cli_subagent_view: Option<Box<dyn Element>>,
 
+    inline_thumbnail_finder: Option<InlineThumbnailFinder>,
+    /// The thumbnails drawn by the last paint.
     inline_thumbnails: Vec<InlineThumbnail>,
     /// Window-space bounds of each inline thumbnail, set during paint.
     inline_thumbnail_bounds: Vec<RectF>,
@@ -173,6 +181,7 @@ impl AltScreenElement {
             max_scroll_top: None,
             cursor_hint_text,
             cli_subagent_view,
+            inline_thumbnail_finder: None,
             inline_thumbnails: Vec::new(),
             inline_thumbnail_bounds: Vec::new(),
             inline_thumbnail_z_index: None,
@@ -181,24 +190,16 @@ impl AltScreenElement {
         }
     }
 
-    /// Draws `thumbnails` over the grid. Clicking one opens all of them in the image lightbox.
+    /// Draws thumbnails of the images `finder` finds in the grid. Clicking one opens all of them
+    /// in the image lightbox.
     pub fn with_inline_thumbnails(
         mut self,
-        thumbnails: Vec<InlineThumbnail>,
+        finder: InlineThumbnailFinder,
         hovered: Rc<Cell<bool>>,
     ) -> Self {
-        self.inline_thumbnails = thumbnails;
+        self.inline_thumbnail_finder = Some(finder);
         self.inline_thumbnail_hovered = hovered;
         self
-    }
-
-    fn inline_thumbnail_size(&self, thumbnail: &InlineThumbnail) -> Vector2F {
-        let size_info = &self.grid_render_params.size_info;
-        let placement = &thumbnail.placement;
-        vec2f(
-            placement.columns.len() as f32 * size_info.cell_width_px().as_f32(),
-            placement.rows.len() as f32 * size_info.cell_height_px().as_f32(),
-        ) - vec2f(INLINE_THUMBNAIL_INSET, INLINE_THUMBNAIL_INSET) * 2.
     }
 
     fn paint_inline_thumbnails(
@@ -207,26 +208,44 @@ impl AltScreenElement {
         ctx: &mut PaintContext,
         app: &AppContext,
     ) {
+        self.inline_thumbnail_bounds.clear();
         if self.inline_thumbnails.is_empty() {
+            self.inline_thumbnail_z_index = None;
             return;
         }
         let size_info = self.grid_render_params.size_info;
+        let cell_size = vec2f(
+            size_info.cell_width_px().as_f32(),
+            size_info.cell_height_px().as_f32(),
+        );
+        let theme = &self.grid_render_params.warp_theme;
         ctx.scene.start_layer(ClipBounds::ActiveLayer);
         self.inline_thumbnail_z_index = Some(ctx.scene.z_index());
-        self.inline_thumbnail_bounds.clear();
-        for index in 0..self.inline_thumbnails.len() {
-            let size = self.inline_thumbnail_size(&self.inline_thumbnails[index]);
-            let thumbnail = &mut self.inline_thumbnails[index];
-            let origin = grid_origin
-                + vec2f(
-                    size_info.padding_x_px().as_f32()
-                        + thumbnail.placement.columns.start as f32
-                            * size_info.cell_width_px().as_f32(),
-                    thumbnail.placement.rows.start as f32 * size_info.cell_height_px().as_f32(),
-                )
-                + vec2f(INLINE_THUMBNAIL_INSET, INLINE_THUMBNAIL_INSET);
-            thumbnail.element.paint(origin, ctx, app);
-            self.inline_thumbnail_bounds.push(RectF::new(origin, size));
+        for thumbnail in &self.inline_thumbnails {
+            let placement = &thumbnail.placement;
+            let inset = vec2f(INLINE_THUMBNAIL_INSET, INLINE_THUMBNAIL_INSET);
+            let bounds = RectF::new(
+                grid_origin
+                    + vec2f(
+                        size_info.padding_x_px().as_f32()
+                            + placement.columns.start as f32 * cell_size.x(),
+                        placement.rows.start as f32 * cell_size.y(),
+                    )
+                    + inset,
+                vec2f(
+                    placement.columns.len() as f32 * cell_size.x(),
+                    placement.rows.len() as f32 * cell_size.y(),
+                ) - inset * 2.,
+            );
+            ctx.scene
+                .draw_rect_with_hit_recording(bounds)
+                .with_background(theme.surface_2())
+                .with_border(Border::all(1.).with_border_fill(theme.outline()))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
+                    INLINE_THUMBNAIL_CORNER_RADIUS,
+                )));
+            paint_inline_thumbnail_image(&thumbnail.source, contract(bounds, inset), ctx, app);
+            self.inline_thumbnail_bounds.push(bounds);
         }
         ctx.scene.stop_layer();
     }
@@ -777,13 +796,6 @@ impl Element for AltScreenElement {
             );
         }
 
-        for index in 0..self.inline_thumbnails.len() {
-            let size = self.inline_thumbnail_size(&self.inline_thumbnails[index]);
-            self.inline_thumbnails[index]
-                .element
-                .layout(SizeConstraint::strict(size), ctx, app);
-        }
-
         constraint.max
     }
 
@@ -800,10 +812,6 @@ impl Element for AltScreenElement {
             && cli_subagent_view.size().is_some()
         {
             cli_subagent_view.after_layout(ctx, app);
-        }
-
-        for thumbnail in &mut self.inline_thumbnails {
-            thumbnail.element.after_layout(ctx, app);
         }
     }
 
@@ -923,8 +931,14 @@ impl Element for AltScreenElement {
             app,
         );
 
+        let inline_thumbnails = self
+            .inline_thumbnail_finder
+            .as_ref()
+            .map(|find| find(grid, cell_size))
+            .unwrap_or_default();
         drop(sampler);
         drop(model);
+        self.inline_thumbnails = inline_thumbnails;
         self.paint_inline_thumbnails(adjusted_grid_origin, ctx, app);
 
         if let Some(cli_subagent_view) = &mut self.cli_subagent_view {
@@ -1115,6 +1129,50 @@ impl Element for AltScreenElement {
     fn origin(&self) -> Option<UiPoint> {
         self.origin
     }
+}
+
+fn contract(rect: RectF, by: Vector2F) -> RectF {
+    RectF::new(rect.origin() + by, rect.size() - by * 2.)
+}
+
+/// Draws the image at `source` scaled to fit within `bounds`, centered.
+fn paint_inline_thumbnail_image(
+    source: &AssetSource,
+    bounds: RectF,
+    ctx: &mut PaintContext,
+    app: &AppContext,
+) {
+    let pixel_bounds = (bounds.size() * ctx.scene.scale_factor()).to_i32();
+    if pixel_bounds.x() <= 0 || pixel_bounds.y() <= 0 {
+        return;
+    }
+    let image = ImageCache::as_ref(app).image(
+        source.clone(),
+        pixel_bounds,
+        FitType::Contain,
+        AnimatedImageBehavior::FirstFramePreview,
+        CacheOption::BySize,
+        ctx.max_texture_dimension_2d,
+        AssetCache::as_ref(app),
+    );
+    let image = match image {
+        AssetState::Loaded { data } => data,
+        AssetState::Loading { handle } => {
+            ctx.repaint_after_load(handle);
+            return;
+        }
+        AssetState::Evicted | AssetState::FailedToLoad(_) => return,
+    };
+    let Image::Static(image) = image.as_ref() else {
+        return;
+    };
+    let size = image.size().to_f32() / ctx.scene.scale_factor();
+    ctx.scene.draw_image(
+        RectF::new(bounds.origin() + (bounds.size() - size) / 2., size),
+        image.clone(),
+        1.,
+        CornerRadius::with_all(Radius::Pixels(INLINE_THUMBNAIL_CORNER_RADIUS / 2.)),
+    );
 }
 
 impl NewScrollableElement for AltScreenElement {

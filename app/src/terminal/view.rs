@@ -2704,7 +2704,7 @@ pub struct TerminalView {
     file_link_scanning_join_handle: Option<JoinHandle<()>>,
 
     #[cfg(feature = "local_fs")]
-    inline_image_paths: crate::terminal::alt_screen::inline_images::ImagePathCache,
+    inline_image_paths: Rc<crate::terminal::alt_screen::inline_images::ImagePathCache>,
     inline_thumbnail_hovered: Rc<Cell<bool>>,
 
     last_focus_ts: Option<NaiveDateTime>,
@@ -25351,12 +25351,9 @@ impl TerminalView {
         }
         alt_screen_element =
             alt_screen_element.with_shared_session_presence(self.shared_session_presence_manager());
-        let inline_thumbnails = self.inline_image_thumbnails(model, app);
-        if !inline_thumbnails.is_empty() {
-            alt_screen_element = alt_screen_element.with_inline_thumbnails(
-                inline_thumbnails,
-                self.inline_thumbnail_hovered.clone(),
-            );
+        if let Some(finder) = self.inline_thumbnail_finder(model, app) {
+            alt_screen_element = alt_screen_element
+                .with_inline_thumbnails(finder, self.inline_thumbnail_hovered.clone());
         }
 
         // Pass voice input toggle key if the CLI agent footer should be rendered
