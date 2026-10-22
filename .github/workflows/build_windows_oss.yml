@@ -44,8 +44,12 @@ jobs:
 
       - name: Build
         shell: bash
+        # `debug-embed` packs fonts and other assets into the binary; debug builds otherwise read
+        # them from this runner's checkout path at runtime, which doesn't exist on other machines.
         # No debug info for the huge `warp` crate keeps the build within the runner's memory.
-        run: cargo build --bin warp-oss --features gui --config 'profile.dev.package.warp.debug=0'
+        run: >-
+          cargo build --bin warp-oss --features gui,rust-embed/debug-embed
+          --config 'profile.dev.package.warp.debug=0'
 
       - name: Package
         shell: pwsh
